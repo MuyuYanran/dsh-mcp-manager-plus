@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -51,14 +51,23 @@ const SEED = `# Your patch layer for this dsh profile.
 /**
  * Boot the plugin against a temporary profile and return a driver for its
  * routes.
- * @param seed - initial patch-file content (defaults to {@link SEED}).
- * @param options - `{ tools, services, loaderEntries, includeEntry }` stubs.
- * @returns `{ patchPath, request, read, dispose, log }`.
+ *
+ * The scratch tree mirrors a real harness home — `<dir>/cordis.patch.yml` as
+ * the shared home layer, `<dir>/profiles/web/cordis.patch.yml` as the
+ * profile's own — because which of those two a toggle has to write to is a
+ * function of the layout, and a test that fakes the layout tests nothing.
+ * @param seed - initial profile patch-file content (defaults to {@link SEED}).
+ * @param options - `{ tools, services, loaderEntries, includeEntry, homeSeed }` stubs.
+ * @returns `{ patchPath, homePatchPath, request, read, dispose, log }`.
  */
 async function boot(seed = SEED, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'mcp-manager-host-'));
-  const patchPath = join(dir, 'cordis.patch.yml');
+  const profileDir = join(dir, 'profiles', 'web');
+  mkdirSync(profileDir, { recursive: true });
+  const patchPath = join(profileDir, 'cordis.patch.yml');
+  const homePatchPath = join(dir, 'cordis.patch.yml');
   if (seed !== null) writeFileSync(patchPath, seed);
+  if (options.homeSeed !== undefined) writeFileSync(homePatchPath, options.homeSeed);
 
   const routes = [];
   const cleanups = [];
@@ -79,7 +88,7 @@ async function boot(seed = SEED, options = {}) {
               options: {
                 id: 'include',
                 name: 'cordis:include',
-                config: { path: options.includeEntry ?? patchPath.replace(/cordis\.patch\.yml$/u, 'cordis.yml') },
+                config: { path: options.includeEntry ?? join(profileDir, 'cordis.yml') },
               },
               fiber: { state: 2 },
               disabled: false,
@@ -139,10 +148,12 @@ async function boot(seed = SEED, options = {}) {
   }
 
   return {
-    dir,
+    dir: profileDir,
     patchPath,
+    homePatchPath,
     request,
     read: () => readFileSync(patchPath, 'utf8'),
+    readHome: () => readFileSync(homePatchPath, 'utf8'),
     parse: () => yaml.load(readFileSync(patchPath, 'utf8'), { schema }),
     dispose() {
       for (const cleanup of cleanups) if (typeof cleanup === 'function') cleanup();
@@ -450,90 +461,33 @@ test('a built-in provider service is listed read-only beside the servers', async
   }
 });
 
-test('a bundle-provided row is listed read-only and togglable', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'mcp-manager-bundle-'));
-  const patchPath = join(dir, 'cordis.patch.yml');
-  writeFileSync(patchPath, '# header\n[]\n');
-  const routes = [];
-  const cleanups = [];
-  const ctx = {
-    get(name) {
-      if (name === 'tools') {
-        return {
-          schemas: () => [
-            { name: 'mcp__shared__ping', description: 'Ping' },
-            { name: 'mcp__shared__pong', description: 'Pong' },
-          ],
-        };
-      }
-      if (name === 'loader') {
-        return {
-          entries: () => [
-            {
-              options: {
-                id: 'include',
-                name: 'cordis:include',
-                config: { path: join(dir, 'cordis.yml') },
-              },
-              fiber: { state: 2 },
-              disabled: false,
-            },
-            {
-              options: {
-                id: 'mcp-shared',
-                name: '@deepseek-ai/dsh-mcp-client',
-                config: { serverName: 'shared', transport: 'stdio', command: 'npx' },
-              },
-              fiber: { state: 2 },
-              disabled: false,
-            },
-          ],
-        };
-      }
-      return undefined;
+/** The composed MCP row a loader hands back for a server named `shared`. */
+function sharedEntry(disabled) {
+  return {
+    options: {
+      id: 'mcp-shared',
+      name: '@deepseek-ai/dsh-mcp-client',
+      config: { serverName: 'shared', transport: 'stdio', command: 'npx' },
     },
-    effect(factory) {
-      const dispose = factory();
-      cleanups.push(dispose);
-      return dispose;
-    },
-    webServer: {
-      register(route) {
-        routes.push(route);
-        return () => {};
-      },
-    },
+    fiber: { state: 2 },
+    disabled,
   };
-  plugin.apply(ctx);
-  const route = routes.find((entry) => entry.path === '/mcp-manager-plus');
-  async function request(method, path, body) {
-    const req = {
-      method,
-      url: `/mcp-manager-plus${path}`,
-      socket: { remoteAddress: '127.0.0.1' },
-      async *[Symbol.asyncIterator]() {
-        if (body !== undefined) yield Buffer.from(JSON.stringify(body), 'utf8');
-      },
-    };
-    let status = 0;
-    let payload = '';
-    const res = {
-      writeHead(code) {
-        status = code;
-      },
-      end(text) {
-        payload = text ?? '';
-      },
-    };
-    await route.handler(req, res);
-    return { status, body: payload === '' ? null : JSON.parse(payload) };
-  }
+}
 
+test('a bundle-provided row is listed read-only and togglable', async () => {
+  const app = await boot('# header\n[]\n', {
+    tools: [
+      { name: 'mcp__shared__ping', description: 'Ping' },
+      { name: 'mcp__shared__pong', description: 'Pong' },
+    ],
+    loaderEntries: [sharedEntry(false)],
+  });
   try {
-    const listing = await request('GET', '/servers');
+    const listing = await app.request('GET', '/servers');
     const shared = listing.body.servers.find((s) => s.serverName === 'shared');
     assert.ok(shared, 'the bundle row must appear');
     assert.equal(shared.source, 'bundle');
+    assert.equal(shared.controlLayer, 'profile', 'a bundle row is still reachable from the profile layer');
     assert.equal(shared.editable, false);
     assert.equal(shared.removable, false);
     assert.equal(shared.live.toolCount, 2);
@@ -542,17 +496,62 @@ test('a bundle-provided row is listed read-only and togglable', async () => {
       ['ping', 'pong'],
     );
 
-    const toggled = await request('POST', '/toggle', { id: 'mcp-shared', enabled: false });
+    const toggled = await app.request('POST', '/toggle', { id: 'mcp-shared', enabled: false });
     assert.equal(toggled.status, 200);
-    assert.equal(toggled.body.state.servers.find((s) => s.serverName === 'shared').enabled, false);
-    assert.match(readFileSync(patchPath, 'utf8'), /- id: mcp-shared\n  disabled: true/);
+    assert.equal(toggled.body.layer, 'profile');
+    assert.match(app.read(), /- id: mcp-shared\n  disabled: true/);
 
-    const remove = await request('POST', '/remove', { id: 'mcp-shared' });
+    // The override is the intent; the loader entry is the fact. This stub
+    // never reloads, so the page must report the fact — an uncomposed override
+    // must not be presented as a server that has stopped feeding the model,
+    // and its tools must stay listed because they are still reaching it.
+    const after = toggled.body.state.servers.find((s) => s.serverName === 'shared');
+    assert.equal(after.enabled, true, 'the loader has not composed the override yet');
+    assert.equal(after.overridePending, true, 'a written override that has not taken effect must be visible');
+    assert.equal(after.live.toolCount, 2, 'tools stay listed while they still reach the model');
+
+    const remove = await app.request('POST', '/remove', { id: 'mcp-shared' });
     assert.equal(remove.status, 400);
     assert.match(remove.body.error, /不能删除|只能停用/);
   } finally {
-    for (const cleanup of cleanups) if (typeof cleanup === 'function') cleanup();
-    rmSync(dir, { recursive: true, force: true });
+    app.dispose();
+  }
+});
+
+test('once the loader composes the override the row really reads as off', async () => {
+  // The same row, this time with its live entry in the state the composition
+  // actually produces. This is what the browser's settle-poll waits for.
+  const seed = `# header
+- insert:
+    - id: mcp-shared
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: shared
+        transport: stdio
+        command: npx
+- id: mcp-shared
+  disabled: true
+`;
+  const app = await boot(seed, {
+    tools: [{ name: 'mcp__shared__ping', description: 'Ping' }],
+    loaderEntries: [sharedEntry(true)],
+  });
+  try {
+    const { body } = await app.request('GET', '/servers');
+    const shared = body.servers.find((s) => s.serverName === 'shared');
+    assert.equal(shared.enabled, false, 'the loader agrees with the override, so the row is off');
+    assert.equal(shared.overridePending, false, 'nothing is pending once the loader agrees');
+    assert.equal(shared.live.phase, 'disabled');
+    assert.equal(shared.live.toolCount, 0);
+
+    const on = await app.request('POST', '/toggle', { id: 'mcp-shared', enabled: true });
+    assert.equal(on.status, 200);
+    // This plugin inserted the row, so nothing holds it down and the override is
+    // simply dropped rather than written back as `disabled: false`.
+    assert.doesNotMatch(app.read(), /disabled:/u);
+    assert.match(app.read(), /serverName: shared/u, 'the definition itself must survive');
+  } finally {
+    app.dispose();
   }
 });
 
@@ -872,5 +871,225 @@ test('a js-yaml without the custom-type API no longer breaks the panel', async (
     else process.env.DSH_HOME = previousHome;
     rmSync(home, { recursive: true, force: true });
     rmSync(seeded, { recursive: true, force: true });
+  }
+});
+
+// ── the shared home layer ───────────────────────────────────────────────────
+//
+// The composed order is bundle → profile → home, and a patch only edits a row
+// that already exists when it runs. A `disabled` override written into the
+// profile layer for a row the HOME layer inserts therefore matches nothing, and
+// the loader skips it with a stderr warning nobody reads: the server kept
+// running and its tool definitions kept reaching the model while the panel said
+// "已停用" and listed zero tools.
+//
+// So the decisive assertion in this section is not on the plugin's own output.
+// It is the kernel's patch algorithm — the same call boot makes — run over the
+// files the plugin actually wrote. It is reproduced here rather than imported
+// because the kernel's own packages are not resolvable from every profile
+// layout (a hoisted install can leave `profiles/node_modules/@deepseek-ai`
+// dangling), and a test that dies while loading is a test that silently does
+// not run. The replica is `applyEntryPatches` from
+// `@deepseek-ai/cordis-plugin-include`, verbatim, and the self-test below
+// pins the two rules the fix rests on so a wrong replica cannot pass by itself.
+
+/**
+ * `applyEntryPatches` from the include plugin, reproduced.
+ * @param data - the entry list to patch.
+ * @param patches - the patch rows, in application order.
+ * @param warn - sink for skipped-patch diagnostics.
+ * @returns the patched entry list.
+ */
+function kernelApplyEntryPatches(data, patches, warn) {
+  // `composeEntries` clones the layer list before applying it; without that the
+  // patches would be mutated in place and a second application would see the
+  // first one's result.
+  data = structuredClone(data);
+  patches = structuredClone(patches);
+  const entryMap = new Map();
+  const buildMap = (entries) => {
+    for (const entry of entries) {
+      if (entry.id) entryMap.set(entry.id, entry);
+      if (entry.group && Array.isArray(entry.config)) buildMap(entry.config);
+    }
+  };
+  buildMap(data);
+  for (const patch of patches) {
+    const { id, insert, name, ...overrides } = patch;
+    if (insert) {
+      if (id) {
+        const target = entryMap.get(id);
+        if (!target || !target.group) continue;
+        if (!Array.isArray(target.config)) target.config = [];
+        target.config.push(...insert);
+      } else data.push(...insert);
+      buildMap(insert);
+      continue;
+    }
+    if (!id) continue;
+    const target = entryMap.get(id);
+    if (!target) {
+      warn({ kind: 'missing', id });
+      continue;
+    }
+    if (name && name !== target.name) continue;
+    for (const [key, value] of Object.entries(overrides)) {
+      if (key === 'id') continue;
+      target[key] = value;
+    }
+  }
+  return data;
+}
+
+/**
+ * The kernel's composition of the two user patch layers, in boot order.
+ * @param profileText - the profile's `cordis.patch.yml`.
+ * @param homeText - the shared `$DSH_HOME/cordis.patch.yml`.
+ * @returns the composed entry list.
+ */
+function composeUserLayers(profileText, homeText) {
+  const layer = (text) => yaml.load(text, { schema });
+  return kernelApplyEntryPatches([], [...layer(profileText), ...layer(homeText)], () => {});
+}
+
+test('the composition replica implements the rule this whole section rests on', () => {
+  const warnings = [];
+  const after = kernelApplyEntryPatches(
+    [],
+    [{ insert: [{ id: 'x', name: 'p' }] }, { id: 'x', disabled: true }],
+    () => {},
+  );
+  assert.equal(after[0].disabled, true, 'an override after the insert wins');
+
+  const before = kernelApplyEntryPatches(
+    [],
+    [{ id: 'x', disabled: true }, { insert: [{ id: 'x', name: 'p' }] }],
+    (warning) => warnings.push(warning),
+  );
+  assert.equal(before[0].disabled, undefined, 'an override before any insert is skipped');
+  assert.deepEqual(warnings, [{ kind: 'missing', id: 'x' }], 'and the skip is announced, not silent');
+});
+
+/** The composed row for one id, or undefined when no layer inserts it. */
+function composedRow(entries, id) {
+  return entries.find((entry) => entry.id === id);
+}
+
+/** The shared layer as a real machine writes it: an insert, no override yet. */
+const HOME_TOOLPACK = `- insert:
+    - id: mcp-toolpack
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: toolpack
+        transport: stdio
+        command: node
+        args: ["server.mjs"]
+`;
+
+/** The composed row a loader hands back for the shared layer's `toolpack`. */
+const TOOLPACK_ENTRY = {
+  options: {
+    id: 'mcp-toolpack',
+    name: '@deepseek-ai/dsh-mcp-client',
+    config: { serverName: 'toolpack', transport: 'stdio', command: 'node' },
+  },
+  fiber: { state: 2 },
+  disabled: false,
+};
+
+test('a shared-layer row is disabled in the shared layer, where the patch can win', async () => {
+  const app = await boot('# header\n[]\n', {
+    homeSeed: HOME_TOOLPACK,
+    tools: [{ name: 'mcp__toolpack__find_tool', description: 'Find' }],
+    loaderEntries: [TOOLPACK_ENTRY],
+  });
+  try {
+    const listing = await app.request('GET', '/servers');
+    const row = listing.body.servers.find((s) => s.serverName === 'toolpack');
+    assert.ok(row, 'the shared-layer row must be listed');
+    assert.equal(row.source, 'shared', 'the shared layer is not a bundle and must not be labelled as one');
+    assert.equal(row.controlLayer, 'home');
+    assert.equal(row.enabled, true);
+    assert.equal(listing.body.homePatchPath, app.homePatchPath);
+    assert.deepEqual(listing.body.issues, [], 'a fresh shared layer has nothing to complain about');
+
+    const toggled = await app.request('POST', '/toggle', { id: 'mcp-toolpack', enabled: false });
+    assert.equal(toggled.status, 200, JSON.stringify(toggled.body));
+    assert.equal(toggled.body.layer, 'home', 'the override must land in the layer applied after the insert');
+    assert.equal(app.read(), '# header\n[]\n', 'the profile layer must not gain a patch that can never match');
+    assert.match(app.readHome(), /- id: mcp-toolpack\n  disabled: true/);
+
+    // The proof: the kernel composes the two files and really sees a disabled row.
+    const composed = composeUserLayers(app.read(), app.readHome());
+    assert.equal(composedRow(composed, 'mcp-toolpack')?.disabled, true);
+
+    // And the file it wrote must still be a legal layer, with the override after
+    // the insert that creates its target.
+    const home = app.readHome();
+    assert.ok(
+      home.indexOf('- insert:') < home.lastIndexOf('- id: mcp-toolpack'),
+      'the override must follow the insert',
+    );
+
+    const on = await app.request('POST', '/toggle', { id: 'mcp-toolpack', enabled: true });
+    assert.equal(on.status, 200);
+    // This plugin does not own the shared layer's definition, so it cannot
+    // assume dropping the override is enough — it writes `disabled: false`
+    // explicitly, which is what a later patch in the same layer is for.
+    assert.match(app.readHome(), /- id: mcp-toolpack\n  disabled: false\n$/u);
+    assert.match(app.readHome(), /serverName: toolpack/u, 'the definition itself must survive');
+    assert.notEqual(composedRow(composeUserLayers(app.read(), app.readHome()), 'mcp-toolpack')?.disabled, true);
+  } finally {
+    app.dispose();
+  }
+});
+
+test('a profile-layer override for a shared-layer row is reported, never obeyed', async () => {
+  const app = await boot('# header\n- id: mcp-toolpack\n  disabled: true\n', {
+    homeSeed: HOME_TOOLPACK,
+    tools: [{ name: 'mcp__toolpack__find_tool', description: 'Find' }],
+    loaderEntries: [TOOLPACK_ENTRY],
+  });
+  try {
+    const { body } = await app.request('GET', '/servers');
+    const row = body.servers.find((s) => s.serverName === 'toolpack');
+    // The kernel skips that patch, so the server is live. The panel must say so
+    // rather than mirror the dead override, and it must keep the tools listed:
+    // this is precisely the state that used to be reported as "off, 0 tools".
+    assert.equal(row.enabled, true);
+    assert.equal(row.live.toolCount, 1);
+    assert.ok(
+      body.issues.some((issue) => issue.includes('mcp-toolpack')),
+      'the override that can never take effect must be reported',
+    );
+    assert.equal(
+      composedRow(composeUserLayers(app.read(), app.readHome()), 'mcp-toolpack')?.disabled,
+      undefined,
+      'the trap this section exists for: that override really does nothing',
+    );
+
+    // Toggling heals it: the dead override is dropped and the live one written.
+    const toggled = await app.request('POST', '/toggle', { id: 'mcp-toolpack', enabled: false });
+    assert.equal(toggled.status, 200);
+    assert.equal(app.read(), '# header\n[]\n', 'the dead override is cleaned up');
+    assert.equal(composedRow(composeUserLayers(app.read(), app.readHome()), 'mcp-toolpack')?.disabled, true);
+    const after = (await app.request('GET', '/servers')).body;
+    assert.deepEqual(after.issues, [], 'nothing left to report once the override is where it works');
+  } finally {
+    app.dispose();
+  }
+});
+
+test('a toggle for a row no layer inserts is refused instead of silently doing nothing', async () => {
+  const app = await boot();
+  try {
+    const before = app.read();
+    const result = await app.request('POST', '/toggle', { id: 'mcp-ghost', enabled: false });
+    assert.equal(result.status, 400);
+    assert.match(result.body.error, /mcp-ghost/u);
+    assert.equal(app.read(), before, 'a refused toggle must not touch the file');
+    assert.equal(existsSync(app.homePatchPath), false, 'nor create a shared layer');
+  } finally {
+    app.dispose();
   }
 });

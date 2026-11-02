@@ -13,10 +13,26 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 const realHome = join(process.env.USERPROFILE, '.dsh');
+/**
+ * Where the real profile resolves `js-yaml` from.
+ *
+ * The previous version linked the whole `<realHome>/profiles/node_modules`
+ * layer into the scratch home, which makes this suite depend on that layer
+ * being intact — and on a pnpm-managed machine it is a set of links into a
+ * store the last upgrade replaced, so `js-yaml` is a dangling symlink and every
+ * test here fails with "no usable copy of js-yaml" for no reason of its own.
+ * Linking the one package that was actually resolved keeps the assertion
+ * (the parser comes from the profile, not this package) and drops the coupling.
+ */
+const profileRequire = createRequire(join(realHome, 'profiles', 'web', 'package.json'));
+const resolvedYaml = profileRequire.resolve('js-yaml');
+const yamlDir = basename(dirname(resolvedYaml)) === 'js-yaml' ? dirname(resolvedYaml) : dirname(dirname(resolvedYaml));
+
 const { apply } = await import('../lib/index.js');
 
 /**
@@ -30,7 +46,9 @@ function boot(initialPatch) {
   const patchPath = join(profileDir, 'cordis.patch.yml');
   writeFileSync(patchPath, initialPatch);
   // `js-yaml` comes from the profile, not this package.
-  symlinkSync(join(realHome, 'profiles', 'node_modules'), join(home, 'profiles', 'node_modules'), 'junction');
+  const scratchModules = join(home, 'profiles', 'node_modules');
+  mkdirSync(scratchModules, { recursive: true });
+  symlinkSync(yamlDir, join(scratchModules, 'js-yaml'), 'junction');
   const previousHome = process.env.DSH_HOME;
   process.env.DSH_HOME = home;
 

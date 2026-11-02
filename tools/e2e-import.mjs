@@ -7,8 +7,9 @@
  * Run with:  node tools/e2e-import.mjs
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 const { apply, name, inject } = await import('../lib/index.js');
 
@@ -21,12 +22,22 @@ mkdirSync(profileDir, { recursive: true });
 const patchPath = join(profileDir, 'cordis.patch.yml');
 writeFileSync(patchPath, '[]\n');
 // `js-yaml` is resolved from the profile rather than bundled with the plugin,
-// so the scratch profile needs a packages directory that can resolve it. A
-// plain directory symlink is enough — the resolver walks up from the anchor.
+// so the scratch profile needs a packages directory that can resolve it.
+//
+// Link the ONE package the real profile actually resolves, not the whole
+// `profiles/node_modules` layer: on a pnpm-managed machine that layer is a set
+// of links into a store the last upgrade replaced, so linking it wholesale
+// turns every check here into "no usable copy of js-yaml" — a green-looking
+// harness that verifies nothing.
+const profileRequire = createRequire(join(realHome, 'profiles', 'web', 'package.json'));
+const resolvedYaml = profileRequire.resolve('js-yaml');
+const yamlDir = basename(dirname(resolvedYaml)) === 'js-yaml' ? dirname(resolvedYaml) : dirname(dirname(resolvedYaml));
+const scratchModules = join(home, 'profiles', 'node_modules');
+mkdirSync(scratchModules, { recursive: true });
 try {
-  symlinkSync(join(realHome, 'profiles', 'node_modules'), join(home, 'profiles', 'node_modules'), 'junction');
+  symlinkSync(yamlDir, join(scratchModules, 'js-yaml'), 'junction');
 } catch (error) {
-  throw new Error(`could not link the real profile's node_modules for js-yaml: ${error.message}`);
+  throw new Error(`could not link js-yaml (${yamlDir}) for the scratch profile: ${error.message}`);
 }
 process.env.DSH_HOME = home;
 

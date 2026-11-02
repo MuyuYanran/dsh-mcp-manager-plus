@@ -258,9 +258,13 @@ test('a slot service reachable only through ctx.get() is never trusted', () => {
   const source = readFileSync(bundlePath, 'utf8');
   // Strip comments first: the bundle explains this pitfall in prose, and only
   // executable code decides whether the bug is present.
+  // Split on `\r?\n`, not `\n`: `.` does not match `\r` in a regular
+  // expression, so on a CRLF checkout every line still ends in `\r` and `$`
+  // never matches — the strip silently becomes a no-op and this check fails on
+  // its own explanatory comment.
   const code = source
     .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
+    .split(/\r?\n/)
     .map((line) => line.replace(/\/\/.*$/, ''))
     .join('\n');
   assert.doesNotMatch(

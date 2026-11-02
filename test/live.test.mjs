@@ -13,15 +13,27 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const dshHome = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '', '.dsh');
 const profileDir = join(dshHome, 'profiles', 'web');
 const patchPath = join(profileDir, 'cordis.patch.yml');
+const homePatchPath = join(dshHome, 'cordis.patch.yml');
 
 const hasProfile = existsSync(join(profileDir, 'package.json'));
+
+/** Every row id the shared home layer inserts, read the way the plugin reads it. */
+function sharedLayerIds() {
+  if (!existsSync(homePatchPath)) return [];
+  const ids = [];
+  const text = readFileSync(homePatchPath, 'utf8');
+  for (const match of text.matchAll(/^\s+-?\s*id:\s*['"]?([\w.-]+)['"]?\s*$/gmu)) ids.push(match[1]);
+  return ids;
+}
+
+const sharedIds = sharedLayerIds();
 
 /**
  * Boot the plugin against the real profile directory.
@@ -120,6 +132,16 @@ const DBX_ENTRY = {
   disabled: false,
 };
 
+/** A shared home layer that defines one MCP row, the way a machine writes it. */
+const SHARED_HOME_PATCH = `- insert:
+    - id: mcp-shared
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: shared
+        transport: stdio
+        command: npx
+`;
+
 test('the real profile is reachable and its patch file parses', { skip: !hasProfile }, async () => {
   const request = await bootReal([
     { options: { id: 'include', name: 'cordis:include', config: { path: join(profileDir, 'cordis.yml') } } },
@@ -128,20 +150,38 @@ test('the real profile is reachable and its patch file parses', { skip: !hasProf
   assert.equal(status, 200);
   assert.equal(body.patchPath, patchPath, 'the plugin must find the real patch file');
   assert.equal(body.profileDir, profileDir);
-  assert.deepEqual(body.issues, [], 'this profile must produce no structural complaints');
+  assert.equal(body.homePatchPath, homePatchPath, 'the shared layer sits one level above profiles/');
+  // A complaint about an override that can never take effect is a finding, not
+  // a parse failure: this machine's file is readable and every issue must be
+  // something the user can act on.
+  for (const issue of body.issues) assert.equal(typeof issue, 'string');
 });
 
-test('the servers this machine configured are all visible, with secrets masked', { skip: !hasProfile }, async () => {
+test('the servers this machine configured are all visible, with secrets masked', { skip: !hasProfile || sharedIds.length === 0 }, async () => {
+  // The machine's MCP rows live in the shared home layer, so the composed tree
+  // has to be simulated from that file — the point of this check is that the
+  // manager sees what a boot would see, including where each row came from.
   const request = await bootReal([
     { options: { id: 'include', name: 'cordis:include', config: { path: join(profileDir, 'cordis.yml') } } },
+    ...sharedIds.map((id) => ({
+      options: { id, name: '@deepseek-ai/dsh-mcp-client', config: { serverName: id.replace(/^mcp-/u, ''), transport: 'stdio' } },
+      fiber: { state: 2 },
+      disabled: false,
+    })),
   ]);
   const { body } = await request('GET', '/servers');
   assert.ok(body.servers.length > 0, 'this profile has at least one MCP server configured');
+  const shared = body.servers.filter((server) => server.source === 'shared');
+  assert.equal(
+    shared.length,
+    sharedIds.length,
+    'every row the shared layer defines must be listed, and labelled as shared',
+  );
 
   for (const server of body.servers) {
     assert.equal(typeof server.serverName, 'string');
     assert.ok(server.serverName.length > 0);
-    assert.ok(['user', 'bundle', 'builtin'].includes(server.source));
+    assert.ok(['user', 'shared', 'bundle', 'builtin'].includes(server.source));
     assert.ok(['stdio', 'streamable-http', 'built-in'].includes(server.transport));
     // No credential-shaped value may survive into the payload.
     for (const [key, value] of Object.entries(server.env ?? {})) {
@@ -195,18 +235,75 @@ test('a failed fiber is reported as failed rather than silently idle', { skip: !
   }
 });
 
-test('a patch-layer disable wins over a live-looking loader entry', { skip: !hasProfile }, async () => {
-  // The patch layer is what the page writes and the loader composes on top of,
-  // so a row it disables reads as disabled; asserting on the machine's own
-  // profile here is what made this suite depend on local state.
-  const { request, dir } = await bootSynthetic(`${DBX_PATCH}- id: mcp-dbx\n  disabled: true\n`, [DBX_ENTRY]);
+test('a patch-layer disable is reported as done only once the loader agrees', { skip: !hasProfile }, async () => {
+  // Two states of the same row, because the difference between them is the
+  // whole point: a written override the loader has not composed yet is a
+  // pending intent, not a server that has stopped feeding the model. Reporting
+  // it as off — with zero tools — is exactly how a guard turns out to be
+  // decorative.
+  const pending = await bootSynthetic(`${DBX_PATCH}- id: mcp-dbx\n  disabled: true\n`, [DBX_ENTRY]);
   try {
-    const { body } = await request('GET', '/servers');
-    const dbx = body.servers.find((server) => server.serverName === 'dbx');
+    const dbx = (await pending.request('GET', '/servers')).body.servers.find((s) => s.serverName === 'dbx');
+    assert.equal(dbx.enabled, true, 'the loader has not composed the override yet');
+    assert.equal(dbx.overridePending, true);
+    assert.equal(dbx.live.toolCount, 0, 'no tools were simulated for this entry');
+  } finally {
+    rmSync(pending.dir, { recursive: true, force: true });
+  }
+
+  const composed = await bootSynthetic(`${DBX_PATCH}- id: mcp-dbx\n  disabled: true\n`, [
+    { ...DBX_ENTRY, disabled: true, fiber: undefined },
+  ]);
+  try {
+    const dbx = (await composed.request('GET', '/servers')).body.servers.find((s) => s.serverName === 'dbx');
     assert.equal(dbx.enabled, false);
+    assert.equal(dbx.overridePending, false);
     assert.equal(dbx.live.phase, 'disabled');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(composed.dir, { recursive: true, force: true });
+  }
+});
+
+test('a row the shared layer defines is labelled shared and points at that layer', { skip: !hasProfile }, async () => {
+  // The shared home layer is composed after the profile layer, so which file
+  // owns a row's switch is not cosmetic: an override written into the wrong one
+  // is skipped by the loader. The scratch tree mirrors a real home, so the
+  // resolution under test is the one a boot does — and `js-yaml` still resolves
+  // through the real profile, which is why this suite needs one.
+  const scratch = mkdtempSync(join(tmpdir(), 'mcp-manager-live-home-'));
+  const fakeProfile = join(scratch, 'profiles', 'web');
+  mkdirSync(fakeProfile, { recursive: true });
+  writeFileSync(join(scratch, 'cordis.patch.yml'), SHARED_HOME_PATCH);
+  writeFileSync(join(fakeProfile, 'cordis.patch.yml'), '# empty\n[]\n');
+  writeFileSync(join(fakeProfile, 'cordis.yml'), '[]\n');
+
+  try {
+    const request = await bootReal([
+      { options: { id: 'include', name: 'cordis:include', config: { path: join(fakeProfile, 'cordis.yml') } } },
+      {
+        options: {
+          id: 'mcp-shared',
+          name: '@deepseek-ai/dsh-mcp-client',
+          config: { serverName: 'shared', transport: 'stdio' },
+        },
+        fiber: { state: 2 },
+        disabled: false,
+      },
+    ]);
+    const { status, body } = await request('GET', '/servers');
+    assert.equal(status, 200, JSON.stringify(body));
+    assert.equal(
+      body.homePatchPath,
+      join(scratch, 'cordis.patch.yml'),
+      'the shared layer is derived from the profile location, one level above profiles/',
+    );
+    const shared = body.servers.find((server) => server.serverName === 'shared');
+    assert.ok(shared, 'the shared-layer row must be listed');
+    assert.equal(shared.source, 'shared', 'the shared layer is not a bundle and must not be labelled as one');
+    assert.equal(shared.controlLayer, 'home', 'the page must know which file owns this switch');
+    assert.equal(shared.enabled, true);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
 });
 

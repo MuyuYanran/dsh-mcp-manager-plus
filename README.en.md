@@ -101,7 +101,7 @@ profile patch layer — that is your configuration data and will not be deleted.
 | --- | --- |
 | List | Shows the MCP servers from the config file |
 | Expand | Open a row to see every tool the server registers with the model, with descriptions |
-| Enable / disable | Writes a `disabled` override into the patch layer; takes effect hot in ~1 s, no dsh restart |
+| Enable / disable | Writes the `disabled` override into **the layer where it can take effect** (the profile layer, or the shared layer that defines the row); hot in ~1 s, no dsh restart. The switch follows the running loader, and marks "disable not in effect" while it has not converged |
 | Edit | Two switchable modes: **form** (field by field) or **JSON** (one large textarea), see below |
 | Restart | Destroys and re-initializes the server's connection in place (config unchanged); for recovering from dropped connections |
 | Delete | Removes the server and all of its override rows from the config file |
@@ -174,13 +174,14 @@ and listed with its reason, so one bad block does not waste the whole paste.
 
 ## Where the config lives
 
-The plugin's single source of truth is the current profile's user patch layer:
+### Adding: the current profile's user patch layer
+
+Adding an MCP server appends one loader patch entry to
+`<profile>/cordis.patch.yml`:
 
 ```
 $DSH_HOME/profiles/<profile>/cordis.patch.yml
 ```
-
-Adding an MCP server appends one loader patch entry to that file:
 
 ```yaml
 - insert:
@@ -195,18 +196,58 @@ Adding an MCP server appends one loader patch entry to that file:
           GITHUB_TOKEN: "…"
 ```
 
-Disabling writes a sibling override row instead:
-
-```yaml
-- id: mcp-github
-  disabled: true
-```
-
 Because the profile runs with `patchReload: live`, the loader re-orchestrates
 the plugin tree within about a second of each save, so config changes are both
 **persistent and hot-effective** — the plugin never mutates the running loader
 tree; it only writes the file, then the browser briefly polls to observe the
 converged state.
+
+### Disabling: the layer that defines the row
+
+Disabling is not "write one row into the profile layer". The patch layers are
+composed in a fixed order:
+
+```
+bundle layers  →  profile layer (<profile>/cordis.patch.yml)  →  shared layer ($DSH_HOME/cordis.patch.yml)  →  --patch
+```
+
+and a patch **can only edit a row that already exists when it runs**. A patch
+that matches nothing is neither an error nor a rollback: the kernel logs
+`patch: entry "…" not found` to stderr and skips it. Therefore:
+
+| The row is defined in | The disable must be written to | Why |
+| --- | --- | --- |
+| A bundle layer (a package in `dsh.profile.bundles`) | the profile layer | bundle layers are composed first, so the profile layer still reaches it |
+| A row this plugin added (an `- insert:` in the profile layer) | the profile layer | within one layer, an override after the insert is enough |
+| **The shared layer `$DSH_HOME/cordis.patch.yml`** | **the shared layer** | the shared layer is composed **after** the profile layer, so a profile-layer override for it is skipped |
+
+Getting this wrong fails silently: the server keeps mounting, its tool
+definitions keep reaching the model context, and the page reports "disabled"
+with zero tools — a guard that looks real and does nothing. So this plugin:
+
+- writes the override into **the layer that wins** (per the table above);
+  `POST /toggle` returns the layer it actually wrote (`layer`);
+- labels each row's origin ("config file" / "shared layer" / "deployment") and,
+  on hover, which layer owns its switch and what that layer covers (a shared
+  layer row applies to every profile);
+- takes the switch state, the tool list and the phase from **the running loader
+  entry**, never from the patch file's intent: an override that has been written
+  but not yet recomposed shows "disable not in effect" and keeps listing the
+  tools that are still in the model context;
+- reports a stale profile-layer `disabled` override for a shared-layer row
+  (written by an older version of this plugin) under "Configuration notes" —
+  one toggle repairs it;
+- refuses a toggle for a row id that no layer inserts, instead of writing a
+  patch that can never match.
+
+Disabling a shared-layer row looks exactly the same, only in a different file
+with a wider scope:
+
+```yaml
+# $DSH_HOME/cordis.patch.yml — must come after that row's - insert:
+- id: mcp-toolpack
+  disabled: true
+```
 
 ## Security model
 
@@ -218,16 +259,27 @@ converged state.
 - **Nothing outside its jurisdiction.** The file is hand-written by users:
   comments, unrelated entries and unknown fields survive a rewrite untouched —
   only the one modified block is rewritten.
+- **Writes land only where they can work.** The override goes to the profile
+  layer or to the shared layer, never to a layer that would skip it; both files
+  are written only when their content actually changed, so a toggle cannot
+  trigger a needless recomposition. A shared layer that is not writable, or a
+  row id no layer inserts, is **refused with an error** instead of silently
+  doing nothing.
 - **Secrets stay local.** Values whose keys look like
   `KEY|PASSWORD|SECRET|TOKEN` are masked on read, and unmasked again when the
   browser echoes them back; real secrets never appear on the page.
-- **Bundle-provided servers are read-only.** Rows contributed by the bundle
-  layer can be enabled/disabled but not edited or deleted.
+- **Bundle-provided and shared-layer servers are read-only.** Rows contributed
+  by the bundle layer or the shared layer can be enabled/disabled but not edited
+  or deleted.
 
 ## Development
 
 ```sh
-node test/run.mjs          # all eight suites (127 assertions)
+node test/run.mjs          # all eight suites (133 assertions)
+
+# the compose suite composes the real bundle layers and needs a kernel anchor;
+# without it those 6 checks skip with the reason
+DSH_APP_ROOT="<dsh install dir — the one holding package.json and node_modules/@deepseek-ai>" node test/run.mjs
 ```
 
 | Suite | Coverage |
@@ -236,9 +288,9 @@ node test/run.mjs          # all eight suites (127 assertions)
 | `test/yaml.test.mjs` | the `js-yaml` compatibility layer: capability probing, skipping an incompatible copy, and `!!js` fidelity under the degraded parser |
 | `test/import.test.mjs` | config formats of 14 tools, the TOML subset, JSON comments and trailing commas |
 | `test/editjson.test.mjs` | JSON-mode editing: in-place updates, renames keeping id and overrides, multi-server rejection |
-| `test/host.test.mjs` | every host-side HTTP route, driving the real `apply()` through a fake Cordis context |
+| `test/host.test.mjs` | every host-side HTTP route, driving the real `apply()` through a fake Cordis context, including where a shared-layer disable is written and what the kernel composes |
 | `test/client.test.mjs` | whether the shell can load the browser bundle and register the settings page, mode switch included |
-| `test/compose.test.mjs` | composing a real profile from the bundle layer, confirming this plugin's rows mount |
+| `test/compose.test.mjs` | composing a real profile from the bundle layers, confirming this plugin's rows mount (needs `DSH_APP_ROOT`) |
 | `test/live.test.mjs` | read-only run against the real profile, confirming live configs read correctly with secrets masked |
 
 The tests use no test framework — just Node's built-in `node:test` — and reuse

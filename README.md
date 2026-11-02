@@ -85,7 +85,7 @@ MCP 服务器行会原样保留——它们是你的配置数据，不会被连�
 | --- | --- |
 | 列表 | 展示配置文件中的 MCP 服务器 |
 | 展开 | 点开一行查看该服务器当前注册到模型的所有工具及其描述 |
-| 启用 / 停用 | 写入补丁层的 `disabled` 覆盖，约 1 秒内热生效，无需重启 dsh |
+| 启用 / 停用 | 把 `disabled` 覆盖写进**能生效的那一层**（profile 层，或这一行定义所在的共享层），约 1 秒内热生效，无需重启 dsh；状态以运行中的 loader 为准，未收敛时会标出「停用未生效」 |
 | 编辑 | 两种模式可随时切换：**表单**（逐字段）或 **JSON**（大输入框），见下节 |
 | 重启 | 就地销毁并重新初始化该服务器的连接（配置不变），用于连接中断后恢复 |
 | 删除 | 从配置文件中移除该服务器及其所有覆盖行 |
@@ -145,13 +145,13 @@ MCP 服务器行会原样保留——它们是你的配置数据，不会被连�
 
 ## 配置写在哪里
 
-插件的「唯一真相」是当前 profile 的用户补丁层：
+### 新增：当前 profile 的用户补丁层
+
+新增一个 MCP 服务器就是向 `<profile>/cordis.patch.yml` 追加一行 loader patch entry：
 
 ```
 $DSH_HOME/profiles/<profile>/cordis.patch.yml
 ```
-
-新增一个 MCP 服务器就是向该文件追加一行 loader patch entry：
 
 ```yaml
 - insert:
@@ -166,16 +166,47 @@ $DSH_HOME/profiles/<profile>/cordis.patch.yml
           GITHUB_TOKEN: "…"
 ```
 
-停用则是同级的 `disabled` 覆盖行：
-
-```yaml
-- id: mcp-github
-  disabled: true
-```
-
 因为 profile 使用 `patchReload: live`，保存后 loader 会在约 1 秒内重新编排插件树，
 所以配置改动**既是持久化的，也是热生效的** —— 插件本身不改动运行中的 loader 树，
 只写文件，然后由浏览器端短暂轮询观察收敛后的实际状态。
+
+### 停用：写进「这一行定义所在的层」
+
+停用不是往 profile 层写一行就完事。补丁文件的组合顺序是固定的：
+
+```
+bundle 层  →  profile 层（<profile>/cordis.patch.yml）  →  共享层（$DSH_HOME/cordis.patch.yml）  →  --patch
+```
+
+而一条补丁**只能改「它被执行时已经存在」的行**；匹配不到目标时内核既不会报错也不会回滚，
+只在 stderr 记一条 `patch: entry "…" not found` 然后跳过。所以：
+
+| 这一行的定义在 | 停用必须写到 | 说明 |
+| --- | --- | --- |
+| bundle 层（`dsh.profile.bundles` 里的包） | profile 层 | bundle 层先组合，profile 层能改到它 |
+| 本插件新增的行（profile 层的 `- insert:`） | profile 层 | 同一层里，覆盖行在插入行之后即可生效 |
+| **共享层 `$DSH_HOME/cordis.patch.yml`** | **共享层** | 共享层在 profile 层**之后**才组合，profile 层的同名覆盖会被跳过 |
+
+写错层的后果是沉默的：服务器照常挂载、它的工具定义照常进入模型上下文，
+而面板会显示「已停用」并列出 0 个工具 —— 一个看起来生效、实质不存在的拦截。
+本插件因此：
+
+- 按上表把覆盖行写进**能生效的那一层**（`POST /toggle` 会返回实际写入的层 `layer`）；
+- 页面上的来源标签会写明这一行是「配置文件 / 共享层 / 部署内置」，
+  悬停可看到该层的开关范围（共享层对所有 profile 生效）；
+- 开关状态、工具列表与阶段**以运行中的 loader 条目为准**，而不是补丁文件的意图：
+  覆盖已写入但还没被重新组合时，会显示「停用未生效」并继续列出仍在模型上下文里的工具；
+- 读取时若发现 profile 层里躺着一条对共享层行的 `disabled` 覆盖（老版本写下的死补丁），
+  会把它列进「配置提示」，切换一次即可修正；
+- 没有任何层插入该行 id 时直接拒绝切换，而不是写一条永远匹配不到的补丁。
+
+共享层的停用写法与 profile 层完全一样，只是文件与作用范围不同：
+
+```yaml
+# $DSH_HOME/cordis.patch.yml —— 必须排在这行的 - insert: 之后
+- id: mcp-toolpack
+  disabled: true
+```
 
 ## 安全约定
 
@@ -184,14 +215,20 @@ $DSH_HOME/profiles/<profile>/cordis.patch.yml
   解析失败则拒绝写入，因此一次错误编辑不会让下次启动失败。
 - **不碰不归它管的内容。** 文件是用户手写的：注释、无关条目、未知字段在改写后原样保留，
   只重写被改动的那一个块。
+- **写入只落在能生效的层。** 覆盖行要么写进 profile 层，要么写进共享层；
+  两边都只在内容真的变化时才落盘，避免无谓地触发一次重新组合。
+  共享层不可写、或该行 id 无人插入时，切换会**明确报错**而不是静默无效。
 - **凭据不外传。** 形如 `KEY|PASSWORD|SECRET|TOKEN` 的配置值在读取时被掩码，
   浏览器回传掩码时再从原值还原，真实密钥不会出现在页面里。
-- **部署内置的服务器只读。** 由 bundle 层提供的行可以停用/启用，但不能编辑或删除。
+- **部署内置与共享层的服务器只读。** 由 bundle 层或共享层提供的行可以停用/启用，但不能编辑或删除。
 
 ## 开发
 
 ```sh
-node test/run.mjs          # 全部八个测试套件（共 127 项）
+node test/run.mjs          # 全部八个测试套件（共 133 项）
+
+# compose 套件要组合真实的 bundle 层，需要内核包锚点；没有它这 6 项会带原因跳过
+DSH_APP_ROOT="<dsh 安装目录，即含 package.json 与 node_modules/@deepseek-ai 的那一层>" node test/run.mjs
 ```
 
 | 套件 | 覆盖范围 |
@@ -200,9 +237,9 @@ node test/run.mjs          # 全部八个测试套件（共 127 项）
 | `test/yaml.test.mjs` | `js-yaml` 兼容层：能力探测、跳过硬编码不兼容的副本、降级解析下 `!!js` 的语义保真 |
 | `test/import.test.mjs` | 14 种工具的配置格式、TOML 子集、JSON 注释与尾逗号 |
 | `test/editjson.test.mjs` | JSON 模式编辑：原地更新、重命名保留 id 与覆盖、多条拒绝 |
-| `test/host.test.mjs` | 宿主端全部 HTTP 路由，用假的 Cordis 上下文驱动真实 `apply()` |
+| `test/host.test.mjs` | 宿主端全部 HTTP 路由，用假的 Cordis 上下文驱动真实 `apply()`；含共享层停用的落层与组合验证 |
 | `test/client.test.mjs` | 浏览器 bundle 能否被 shell 加载并注册设置页，含模式开关 |
-| `test/compose.test.mjs` | 用真实的 bundle 层组合 profile，确认本插件的行能挂载 |
+| `test/compose.test.mjs` | 用真实的 bundle 层组合 profile，确认本插件的行能挂载（需 `DSH_APP_ROOT`） |
 | `test/live.test.mjs` | 只读地跑真实 profile，确认线上配置能被正确读出且凭据已掩码 |
 
 测试不依赖任何测试框架，只用 Node 内置的 `node:test`，并复用 profile 中已有的
