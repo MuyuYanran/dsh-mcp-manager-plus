@@ -14,8 +14,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readDocument, readPatchText } from '../lib/patch.js';
 
 const dshHome = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '', '.dsh');
 const profileDir = join(dshHome, 'profiles', 'web');
@@ -24,13 +26,28 @@ const homePatchPath = join(dshHome, 'cordis.patch.yml');
 
 const hasProfile = existsSync(join(profileDir, 'package.json'));
 
-/** Every row id the shared home layer inserts, read the way the plugin reads it. */
+// The plugin's own patch reader, so this suite sees the home layer exactly as
+// the panel does. A regex over `id:` lines would also pick up the override rows
+// (`- id: X` + `disabled: true`), which name a row without defining it.
+const yaml = hasProfile ? createRequire(join(profileDir, 'package.json'))('js-yaml') : null;
+const schema =
+  yaml === null
+    ? null
+    : yaml.JSON_SCHEMA.extend(
+        new yaml.Type('tag:yaml.org,2002:js', {
+          kind: 'scalar',
+          resolve: (data) => typeof data === 'string',
+          construct: (data) => ({ __jsExpr: data }),
+          predicate: (value) => value !== null && typeof value === 'object' && typeof value.__jsExpr === 'string',
+          represent: (value) => value.__jsExpr,
+        }),
+      );
+
+/** Every MCP row the shared home layer defines, as the plugin reads it. */
 function sharedLayerIds() {
-  if (!existsSync(homePatchPath)) return [];
-  const ids = [];
-  const text = readFileSync(homePatchPath, 'utf8');
-  for (const match of text.matchAll(/^\s+-?\s*id:\s*['"]?([\w.-]+)['"]?\s*$/gmu)) ids.push(match[1]);
-  return ids;
+  if (!hasProfile || !existsSync(homePatchPath)) return [];
+  const document = readDocument(readPatchText(homePatchPath), yaml, schema);
+  return document.rows.map((row) => row.id).filter((id) => typeof id === 'string' && id !== '');
 }
 
 const sharedIds = sharedLayerIds();
