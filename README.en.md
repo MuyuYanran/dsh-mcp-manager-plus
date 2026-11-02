@@ -196,11 +196,21 @@ $DSH_HOME/profiles/<profile>/cordis.patch.yml
           GITHUB_TOKEN: "…"
 ```
 
-Because the profile runs with `patchReload: live`, the loader re-orchestrates
-the plugin tree within about a second of each save, so config changes are both
-**persistent and hot-effective** — the plugin never mutates the running loader
-tree; it only writes the file, then the browser briefly polls to observe the
-converged state.
+A config change is **written to disk first, then left to the loader to
+converge**: the plugin never mutates the running loader tree — it only writes the
+file, and the browser briefly polls to observe the actual state. Hot reload of
+patch files comes from the kernel's `dsh-hmr`, which watches both the profile
+patch file and the shared-layer patch file, and which a profile can switch off:
+
+```yaml
+- id: hmr
+  disabled: true      # with hmr off, patch-file edits take effect on the next dsh start
+```
+
+The page therefore never claims "done": after the override is written, the
+switch and the tool list still follow the running loader, and until it converges
+they show "disable not in effect" and keep listing the tools that are still in
+the model context.
 
 ### Disabling: the layer that defines the row
 
